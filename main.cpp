@@ -476,30 +476,37 @@ SkullGrid create_skull_grid(std::span<Card> cards, const Pyramid pyramid)
 /*------------------------------------------------------------------*/
 // Permutations:
 
+// How many times to shuffle the cards (without increasing score) in beginning before giving up:
+constexpr size_t SHUFFLE_STALL_INDICATOR = 20'000;
+
+constexpr size_t MIN_MUTATION_LEVEL = 2;
+constexpr size_t MAX_MUTATION_LEVEL = 5;
+
+// How may times to mutate at a given mutation-level before moving to the next mutation level;
+constexpr size_t MUTATION_STALL_INDICATOR = 4'000;
+
+// How many timmes to work each leaderboard element (without increasing its score) before giving up:
+constexpr size_t LEADERBOARD_STALL_INDICATOR = 30;
+
+thread_local std::random_device rd;
+thread_local std::mt19937 mt(rd());
+
 struct Permutation
 {
     int score;
-    std::vector<Card> cards;
+    std::vector<Card> cards; // ALL cards available. Mostly, only the relevant ([0:pyramid.size]) cards are actually used.
     Pyramid pyramid;
 
-    void print(std::string prefix_message)
+    void print()
     {
-        fmt::print("\n{}\nScore: {}\n", prefix_message, score);
+        fmt::print("Score: {}\n", score);
         auto skull_grid = create_skull_grid(std::span(cards), pyramid);
         fmt::print("Permutation:\n");
         for (auto c : cards)
             fmt::print("{} ", c.id);
         fmt::print("\n");
         skull_grid.print();
-    }
-
-    void shuffle()
-    {
-        thread_local std::random_device rd;
-        thread_local std::mt19937 mt(rd());
-
-        std::shuffle(cards.begin(), cards.end(), mt);
-        score = create_skull_grid(cards, pyramid).get_score();
+        fmt::print("\n");
     }
 
     void random_swap(const size_t swaps)
@@ -514,73 +521,106 @@ struct Permutation
         score = create_skull_grid(cards, pyramid).get_score();
     }
 
-    bool evolve_by_shuffle()
+    // Randomly shuffles the whole permutation in order to find a suitable starting point.
+    void shuffle()
     {
-        const size_t stall_indicator = 1'000'000;
+        const size_t stall_indicator = SHUFFLE_STALL_INDICATOR;
 
         Permutation leader = *this;
         Permutation p = *this;
 
+        // In case this was previously initialized and leader has to be reset to a random value:
+        std::shuffle(leader.cards.begin(), leader.cards.end(), mt);
+        leader.score = create_skull_grid(leader.cards, leader.pyramid).get_score();
+
         size_t stall_counter = 0;
         while (true)
         {
-            p.shuffle();
+            std::shuffle(p.cards.begin(), p.cards.end(), mt);
+            p.score = create_skull_grid(p.cards, p.pyramid).get_score();
+
             if (p.score > leader.score)
             {
                 leader = p;
                 stall_counter = 0;
             }
             else
-            {
-                ++stall_counter;
-                if (stall_counter >= stall_indicator)
+                if (++stall_counter >= stall_indicator)
                     break;
-            }
         }
-
-        if (leader.score > this->score)
-        {
-            *this = leader;
-            return true;
-        }
-        else
-            return false;
+        *this = leader;
     }
-    
-    // Evolves by making random swaps. Keeps evolving until stalls.
-    bool evolve_by_swap(const size_t swaps_per_evolve)
+
+    // Performs the most beneficial swap of two cards in the current permutation.
+    void evolve()
     {
-        const size_t stall_indicator = 1'000'000;
+        Permutation leader = *this;
+        Permutation p = *this;
+
+        bool new_leader_found = false;
+
+        // Sort and make swaps only within the relevant part of the permutation:
+        std::sort(p.cards.begin(), p.cards.begin() + pyramid.size);
+        do
+        {
+            p.score = create_skull_grid(p.cards, p.pyramid).get_score();
+            if (p.score > leader.score)
+            {
+                leader = p;
+                new_leader_found = true;
+            }
+            std::reverse(p.cards.begin() + 2, p.cards.begin() + pyramid.size);
+        } while (std::next_permutation(p.cards.begin(), p.cards.begin() + pyramid.size));
+
+        if (new_leader_found)
+            *this = leader;
+    }
+
+    // Performs random swaps in whole permutation in order to find a higher or equal score. Then evolves the found permutation.
+    void evolve_with_mutation()
+    {
+        size_t stall_counter = 0;
 
         Permutation leader = *this;
         Permutation p;
 
-        size_t stall_counter = 0;
+        size_t swaps = MIN_MUTATION_LEVEL;
+
         while (true)
         {
             p = leader;
-            p.random_swap(swaps_per_evolve);
 
-            if (p.score > leader.score)
+            for (size_t i = 0; i != swaps; ++i)
+            {
+                size_t first, second;
+                first = rand() % p.cards.size();
+                second = rand() % p.cards.size();
+                std::swap(p.cards[first], p.cards[second]);
+            }
+            p.score = create_skull_grid(p.cards, p.pyramid).get_score();
+
+            if (p.score == leader.score)
+                leader = p;
+
+            if (p.score > leader.score) // Finding a better mutation terminates search.
             {
                 leader = p;
-                stall_counter = 0;
+                break;
             }
-            else
+            else // If no better  mutation was found, try again until we stall. Then start again with a higher swap-amount. Continue until max swap amount is reached.
             {
-                ++stall_counter;
-                if (stall_counter >= stall_indicator)
-                    break;
+                if (++stall_counter >= MUTATION_STALL_INDICATOR)
+                {
+                    if (++swaps >= MAX_MUTATION_LEVEL)
+                        break;
+                    else
+                        stall_counter = 0;
+                }
             }
         }
 
-        if (leader.score > this->score)
-        {
-            *this = leader;
-            return true;
-        }
-        else
-            return false;
+        leader.evolve();
+        *this = leader;
     }
 };
 
@@ -601,17 +641,13 @@ std::vector<Permutation> create_leaderboard(
     Permutation p = create_permutation(cards, pyramid);
 
     // Create random leaderboard:
-    std::vector<Permutation> leaderboard;
+    std::vector<Permutation> leaderboard { thread_count };
+    std::vector<std::future<void>> futures { thread_count };
     for (size_t i = 0; i != thread_count; ++i)
     {
-        p.shuffle();
-        leaderboard.push_back(p);
+        leaderboard[i] = p;
+        futures[i] = std::async(std::launch::async, &Permutation::shuffle, &leaderboard[i]);
     }
-
-    // Evolve each permutation by shuffling it:
-    std::vector<std::future<bool>> futures { thread_count };
-    for (size_t i = 0; i != thread_count; ++i)
-        futures[i] = std::async(std::launch::async, &Permutation::evolve_by_shuffle, &leaderboard[i]);
 
     for (size_t i = 0; i != thread_count; ++i)
         futures[i].wait();
@@ -621,21 +657,77 @@ std::vector<Permutation> create_leaderboard(
 
 std::vector<Permutation> evolve_leaderboard(
     std::vector<Permutation> leaderboard,
-    const size_t thread_count,
-    const size_t swaps_per_evolve)
+    const size_t thread_count)
 {
-    // Evolve each permutation by shuffling it:
-    std::vector<std::future<bool>> futures { thread_count };
+    std::vector<Permutation> worked_leaderboard = leaderboard;
+    std::vector<std::future<void>> futures { thread_count };
+    std::vector<size_t> stall_counters(thread_count, 0);
     for (size_t i = 0; i != thread_count; ++i)
-        futures[i] = std::async(std::launch::async, &Permutation::evolve_by_swap, &leaderboard[i], swaps_per_evolve);
+        futures[i] = std::async(std::launch::async, &Permutation::evolve, &worked_leaderboard[i]);
 
-    for (size_t i = 0; i != thread_count; ++i)
+    auto get_leader =[&]()
     {
-        
+        auto highest = leaderboard.front().score;
+        for (auto p : leaderboard)
+            if (p.score > highest)
+                highest = p.score;
+        return highest;
+    };
+
+    int threads_finished = 0;
+    while (threads_finished != thread_count)
+    {
+        for (size_t i = 0; i != thread_count; ++i)
+        {
+            if (futures[i].valid() && is_ready(futures[i]))
+            {
+                bool launch_next = true;
+                futures[i].get();
+
+                if (worked_leaderboard[i].score > leaderboard[i].score)
+                {
+                    fmt::print("\nThread {}. Successful evolution:\n", i);
+                    worked_leaderboard[i].print();
+
+                    leaderboard[i] = worked_leaderboard[i];
+                    stall_counters[i] = 0;
+                }
+                else
+                {
+                    if (++stall_counters[i] == LEADERBOARD_STALL_INDICATOR)
+                    {
+                        if (worked_leaderboard[i].score < get_leader())
+                        {
+                            if (threads_finished == thread_count - 1)
+                            {
+                                fmt::print("\nThread {} stalled; potential for improvement, but all other threads finished - terminating;", i);
+                                ++threads_finished;
+                                launch_next = false;
+                            }
+                            // There is potential to improve, but this thread has run into a dead end. Reset:
+                            fmt::print("\nThread {} stalled; potential for improvement - reshuffling;", i);
+                            worked_leaderboard[i].shuffle();
+                            leaderboard[i] = worked_leaderboard[i];
+                            futures[i] = std::async(std::launch::async, &Permutation::evolve, &worked_leaderboard[i]);
+                            stall_counters[i] = 0;
+                            launch_next = false;
+                        }
+                        else
+                        {
+                            // Total dead end:
+                            fmt::print("\nThread {} stalled; no proof of improvement - terminating\n", i);
+                            ++threads_finished;
+                            launch_next = false;
+                        }
+
+                    }
+                }
+
+                if (launch_next)
+                    futures[i] = std::async(std::launch::async, &Permutation::evolve_with_mutation, &worked_leaderboard[i]);
+            }
+        }
     }
-    
-    for (size_t i = 0; i != thread_count; ++i)
-        futures[i].wait();
 
     return leaderboard;
 }
@@ -665,8 +757,7 @@ int main()
         }
 
         // Prepare threads
-        const size_t thread_count = std::thread::hardware_concurrency();
-        size_t available_threads = thread_count;
+        const size_t thread_count = std::thread::hardware_concurrency() - 1;
         std::vector<std::future<std::pair<int, std::vector<Card>>>> futures { thread_count };
         std::vector<std::pair<int, std::vector<Card>>> thread_local_leaders { thread_count };
 
@@ -676,16 +767,14 @@ int main()
         auto print_leaderboard =[&]()
         {
             for (size_t i = 0; i != leaderboard.size(); ++i)
-                leaderboard[i].print(fmt::format("Thread #{}:\n", i));
+            {
+                fmt::print("Thread #{}:\n", i);
+                leaderboard[i].print();
+            }
         };
-        
-        fmt::print("Created Leaderboard:\n");
-        print_leaderboard();
 
-        fmt::print("Evolved leaderboard:\n");
-        
-        size_t swaps_per_evolve = 1;
-        evolve_leaderboard(leaderboard, thread_count, swaps_per_evolve);
+        leaderboard = evolve_leaderboard(leaderboard, thread_count);
+        fmt::print("\nFINAL RESULTS:\n");
         print_leaderboard();
     }
 }
